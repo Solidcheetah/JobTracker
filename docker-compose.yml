@@ -1,0 +1,163 @@
+name: jobtracker
+
+# Config lives in env.docker, not .env:
+#
+#   docker compose --env-file env.docker up --build
+#
+# That file is both the ${...} substitution source and the `env_file:` for the
+# backend containers, so app settings are declared once, in one place. The only
+# variables restated below are the ones a service needs under a *different* name
+# than the app uses (the Postgres image's idea of POSTGRES_USER is not the app's).
+
+x-backend: &backend
+  build:
+    context: ./backend
+  env_file:
+    - env.docker
+    # Optional, untracked overrides. Listed here so that container variables and
+    # ${...} substitution stay in agreement: pass the same pair on the CLI —
+    #   docker compose --env-file env.docker --env-file env.docker.local ...
+    # Overriding only one of the two is how you end up with a frontend published
+    # on a new port while FRONTEND_ORIGIN still names the old one.
+    - path: env.docker.local
+      required: false
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      # To the Postgres image, POSTGRES_USER means "the superuser to create" —
+      # the opposite of what it means to the app, where it is the unprivileged
+      # role. Hence the explicit remap: the image gets the admin credentials, and
+      # the app role is created separately by the init script below.
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:?missing in env.docker}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?missing in env.docker}
+      POSTGRES_DB: ${POSTGRES_DB:?missing in env.docker}
+      APP_USER: ${POSTGRES_USER:?missing in env.docker}
+      APP_PASSWORD: ${POSTGRES_PASSWORD:?missing in env.docker}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init-app-user.sh:/docker-entrypoint-initdb.d/10-init-app-user.sh:ro
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?missing in env.docker}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?missing in env.docker}
+    ports:
+      # Management UI only. The AMQP port is deliberately not published — nothing
+      # outside the compose network needs to speak to the broker directly.
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      # The broker takes appreciably longer to boot than Postgres or Redis, and
+      # without this the first few checks fail and count against `retries`.
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot: brings the schema up to head, then exits. The API waits on it.
+  migrate:
+    <<: *backend
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    <<: *backend
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/openapi.json', timeout=3).status == 200 else 1)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # Polls for due reminders and publishes them. Same image as the API, different
+  # command — it shares the models, settings and services, just not the process.
+  #
+  # Safe to scale: `docker compose up -d --scale reminder-scanner=3`. The claiming
+  # UPDATE uses FOR UPDATE SKIP LOCKED, so replicas divide the due rows between
+  # them instead of each publishing the same ones. This is the main practical
+  # advantage over a Celery Beat schedule, which has to be a single instance.
+  reminder-scanner:
+    <<: *backend
+    command: ["python", "-m", "app.workers.scanner"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Consumes due reminders and delivers them. Also safe to scale — RabbitMQ gives
+  # each message to exactly one consumer.
+  reminder-notifier:
+    <<: *backend
+    command: ["python", "-m", "app.workers.notifier"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Vite inlines this at build time, so it is an ARG rather than a runtime
+        # variable. Rebuild the image to change it.
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    depends_on:
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  rabbitmq-data:

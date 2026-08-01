@@ -1,0 +1,31 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aio-pika>=9.5.7",
+    "aiosmtplib>=5.1.2",
+    "alembic>=1.18.5",
+    "asyncpg>=0.31.0",
+    "fastapi[all]>=0.139.1",
+    "greenlet>=3.5.3",
+    "pwdlib[argon2]>=0.3.0",
+    "pyjwt>=2.13.0",
+    "redis[hiredis]>=8.0.1",
+    "scalar-fastapi>=1.8.2",
+    "sqlmodel>=0.0.39",
+]
+
+[dependency-groups]
+dev = [
+    "aiosqlite>=0.22.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
